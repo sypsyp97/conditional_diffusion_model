@@ -1,6 +1,6 @@
 # Diffusion Cleaner
 
-Diffusion Cleaner is a implementation of conditional diffusion models designed for image artifact removal. This repo demonstrates how to train and use diffusion models to clean images by conditioning on corrupted versions containing artifacts.
+Diffusion Cleaner is the implementation of conditional diffusion models designed for image artifact removal. This repo demonstrates how to train and use diffusion models to clean images by conditioning on corrupted versions containing artifacts.
 
 ![Results](restoration_results_4samples.png)
 
