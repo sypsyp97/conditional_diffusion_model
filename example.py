@@ -22,9 +22,9 @@ class ModelConfig:
     learning_rate: float = 1e-4
     image_size: int = 32
     channels: int = 1
-    lr_warmup_steps: int = 500
+    lr_warmup_steps: int = 700
     num_train_timesteps: int = 1000
-    num_inference_steps: int = 50
+    num_inference_steps: int = 100
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 class NoisyMNISTDataset(Dataset):
@@ -150,7 +150,7 @@ class DiffusionCleaner:
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=True,
-            drop_last=True
+            drop_last=False
         )
         self.val_dataloader = DataLoader(
             val_dataset,
@@ -165,7 +165,7 @@ class DiffusionCleaner:
             drop_last=False
         )
 
-    def _setup_optimization(self) -> Tuple[torch.optim.AdamW, torch.optim.lr_scheduler.LRScheduler]:
+    def _setup_optimization(self) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
         """Set up optimizer and learning rate scheduler."""
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
         lr_scheduler = get_cosine_schedule_with_warmup(
@@ -418,6 +418,7 @@ class DiffusionCleaner:
 
 def main():
     """Main execution function."""
+    torch.manual_seed(1234)    # Set random seed for reproducibility
     try:
         torchvision.disable_beta_transforms_warning()
         config = ModelConfig()
