@@ -1,0 +1,12 @@
+name: diffusion-cleaner
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch<2.5.0
+  - torchvision
+  - cudatoolkit=11.8  # Remove or adjust this line if not using CUDA 11.3
+  - diffusers
+  - matplotlib
