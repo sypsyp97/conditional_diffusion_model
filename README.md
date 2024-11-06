@@ -14,7 +14,7 @@ conda activate diffusion-cleaner
 ## Usage
 
 ```bash
-git clone https://github.com/yourusername/diffusion-cleaner.git
+git clone https://github.com/sypsyp97/diffusion-cleaner.git
 cd diffusion-cleaner
 python example.py
 ```
