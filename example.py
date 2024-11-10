@@ -16,16 +16,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelConfig:
-    """Configuration parameters for the diffusion model."""
-    batch_size: int = 64
-    num_epochs: int = 30
-    learning_rate: float = 1e-4
-    image_size: int = 32
-    channels: int = 1
-    lr_warmup_steps: int = 700
-    num_train_timesteps: int = 1000
-    num_inference_steps: int = 100
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    """
+    Configuration parameters for the diffusion model.
+    Includes batch size, number of epochs, learning rate, and model directory.
+    """
+    batch_size: int = 64  # Number of samples per training batch
+    num_epochs: int = 30  # Total number of training epochs
+    learning_rate: float = 1e-4  # Learning rate for the optimizer
+    image_size: int = 32  # Size to which input images are resized
+    channels: int = 1  # Number of channels, 1 for grayscale images (MNIST)
+    lr_warmup_steps: int = 700  # Number of warmup steps for learning rate scheduling
+    num_train_timesteps: int = 1000  # Total number of timesteps during training
+    num_inference_steps: int = 100  # Total number of steps during inference
+    num_cycles: float = 1.0  # Number of cycles for cosine scheduler
+    checkpoint_dir: str = './conditional/checkpoints'  # Directory to save model checkpoints
+    data_dir: str = './conditional/data'  # Directory to store the dataset
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"  # Use GPU if available
 
 class NoisyMNISTDataset(Dataset):
     """
@@ -40,36 +46,57 @@ class NoisyMNISTDataset(Dataset):
             train: If True, creates dataset from training data
             transform: Optional transform to be applied on images
         """
+        # Download MNIST dataset
         self.mnist = datasets.MNIST(root=root, train=train, download=True, transform=transform)
 
     def add_artifacts(self, img: torch.Tensor) -> torch.Tensor:
-        """Add random artificial artifacts to the image."""
+        """
+        Add random artificial artifacts to the image to create noisy versions.
+        This involves adding random white patches of varying sizes.
+        
+        Args:
+            img: Clean MNIST image tensor
+        Returns:
+            Noisy image tensor with added artifacts
+        """
         noisy_img = img.clone()
-        # Random number of patches (3 to 5)
+        # Random number of patches to add, between 3 to 5
         num_patches = torch.randint(3, 6, (1,)).item()
 
+        # Loop over the number of patches and add them to the image
         for _ in range(num_patches):
-            # Random patch size between 5 and 8 pixels
+            # Random patch size between 5 and 10 pixels
             patch_h = torch.randint(5, 11, (1,)).item()
             patch_w = torch.randint(5, 11, (1,)).item()
 
-            # Random position ensuring patch fits within image
+            # Random position for the patch, ensuring it fits within the image
             max_h = img.shape[1] - patch_h
             max_w = img.shape[2] - patch_w
             h_start = torch.randint(0, max_h + 1, (1,)).item()
             w_start = torch.randint(0, max_w + 1, (1,)).item()
 
-            # Add white patch
+            # Add a white patch to the image
             noisy_img[:, h_start:h_start+patch_h, w_start:w_start+patch_w] = 1.0
 
-        return torch.clamp(noisy_img, 0, 1)
+        return torch.clamp(noisy_img, 0, 1)  # Ensure pixel values are within valid range [0, 1]
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns paired clean and noisy images.
+        
+        Args:
+            idx: Index of the image to retrieve
+        Returns:
+            Tuple containing the clean and noisy image
+        """
         clean_img, _ = self.mnist[idx]
-        noisy_img = self.add_artifacts(clean_img)
+        noisy_img = self.add_artifacts(clean_img)  # Generate noisy version of the clean image
         return clean_img, noisy_img
 
     def __len__(self) -> int:
+        """
+        Returns the total number of images in the dataset.
+        """
         return len(self.mnist)
 
 class DiffusionCleaner:
@@ -94,58 +121,69 @@ class DiffusionCleaner:
         self.transform = self._setup_transforms()
         self._setup_data()
         self.optimizer, self.lr_scheduler = self._setup_optimization()
-        self.best_val_loss = float('inf')
-        self.checkpoint_dir = './checkpoints'
+        self.best_val_loss = float('inf')  # Best validation loss initialized to infinity
+        self.checkpoint_dir = self.config.checkpoint_dir
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
 
         logger.info(f"Model initialized on device: {self.device}")
 
     def _setup_model(self):
-        """Initialize and configure the UNet model."""
+        """
+        Initialize and configure the UNet model used for image denoising.
+        Returns:
+            Initialized UNet2DModel
+        """
         model = UNet2DModel(
-            sample_size=self.config.image_size,
-            in_channels=self.config.channels * 2,
-            out_channels=self.config.channels,
-            layers_per_block=2,
-            block_out_channels=(32, 64, 128, 256),
-            down_block_types=("DownBlock2D",) * 4,
-            up_block_types=("UpBlock2D",) * 4,
+            sample_size=self.config.image_size,  # Size of input images
+            in_channels=self.config.channels * 2,  # Number of input channels (clean + noisy)
+            out_channels=self.config.channels,  # Output channels (predicted noise)
+            block_out_channels=(32, 64, 128, 256),  # Channels per block
         ).to(self.device)
         return model
 
     def _setup_scheduler(self):
-        """Initialize the noise scheduler."""
+        """
+        Initialize the noise scheduler for diffusion.
+        Returns:
+            DDIMScheduler instance for controlling noise addition
+        """
         return DDIMScheduler(
-            num_train_timesteps=self.config.num_train_timesteps,
-            beta_schedule="linear",
-            prediction_type="epsilon"
+            num_train_timesteps=self.config.num_train_timesteps,  # Number of timesteps for noise scheduling
+            beta_schedule="linear",  # Beta schedule for noise levels
+            prediction_type="epsilon"  # Type of prediction used
         )
 
     def _setup_transforms(self) -> transforms.Compose:
-        """Set up image transformations."""
+        """
+        Set up image transformations for preprocessing.
+        Returns:
+            A Compose object with resizing and tensor conversion
+        """
         return transforms.Compose([
-            transforms.Resize(self.config.image_size),
-            transforms.ToTensor(),
+            transforms.Resize(self.config.image_size),  # Resize images to the specified size
+            transforms.ToTensor(),  # Convert images to PyTorch tensors
         ])
 
     def _setup_data(self) -> None:
-        """Initialize dataset and dataloader."""
+        """
+        Initialize dataset and dataloaders for training, validation, and testing.
+        """
         # Define the transform
         transform = self._setup_transforms()
 
-        # Load the MNIST dataset
-        full_dataset = NoisyMNISTDataset("./data", train=True, transform=transform)
+        # Load the MNIST dataset with clean and noisy images
+        full_dataset = NoisyMNISTDataset(self.config.data_dir, train=True, transform=transform)
 
-        # Split into train and validation
+        # Split the dataset into training and validation datasets
         train_size = int(0.8 * len(full_dataset))
         val_size = len(full_dataset) - train_size
         train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
 
-        # Test dataset
-        test_dataset = NoisyMNISTDataset("./data", train=False, transform=transform)
+        # Create test dataset
+        test_dataset = NoisyMNISTDataset(self.config.data_dir, train=False, transform=transform)
 
-        # Dataloaders
+        # Create data loaders for batching data during training and validation
         self.train_dataloader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
@@ -166,52 +204,77 @@ class DiffusionCleaner:
         )
 
     def _setup_optimization(self) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
-        """Set up optimizer and learning rate scheduler."""
+        """
+        Set up optimizer and learning rate scheduler.
+        
+        Returns:
+            Tuple containing the optimizer and learning rate scheduler
+        """
+        # Optimizer for model weights
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate)
+        # Cosine scheduler with warmup to adjust learning rate during training
         lr_scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             num_warmup_steps=self.config.lr_warmup_steps,
             num_training_steps=(len(self.train_dataloader) * self.config.num_epochs),
+            num_cycles=self.config.num_cycles
         )
         return optimizer, lr_scheduler
 
     def train(self):
-        """Execute the training loop."""
+        """
+        Execute the full training loop for the model, including validation.
+        """
         self.model.train()
 
         for epoch in range(self.config.num_epochs):
-            self._train_epoch(epoch)
-            self.validate(epoch)
+            self._train_epoch(epoch)  # Train the model for one epoch
+            self.validate(epoch)  # Validate the model after each epoch
 
     def _train_epoch(self, epoch: int):
-        """Train the model for one epoch."""
+        """
+        Train the model for one epoch by iterating over the training dataset.
+        
+        Args:
+            epoch: The current epoch number
+        """
         for batch_idx, (clean_images, noisy_images) in enumerate(self.train_dataloader):
-            loss = self._train_step(clean_images, noisy_images)
+            loss = self._train_step(clean_images, noisy_images)  # Perform a training step
 
+            # Log training information every 100 batches
             if batch_idx % 100 == 0:
                 lr = self.lr_scheduler.get_last_lr()[0]
                 logger.info(f"Epoch {epoch} | Batch {batch_idx} | Loss: {loss:.4f} | LR: {lr:.6f}")
 
     def _train_step(self, clean_images: torch.Tensor, condition_images: torch.Tensor) -> float:
-        """Execute a single training step."""
+        """
+        Execute a single training step on a batch of data.
+        
+        Args:
+            clean_images: Clean images used for adding noise
+            condition_images: Noisy images used as conditioning input
+        Returns:
+            Training loss value
+        """
         clean_images = clean_images.to(self.device)
         condition_images = condition_images.to(self.device)
 
-        # Sample noise and timesteps
+        # Sample random noise to add to the clean images and select timesteps
         noise = torch.randn_like(clean_images)
         timesteps = torch.randint(
             0, self.noise_scheduler.config.num_train_timesteps,
             (clean_images.shape[0],), device=self.device
         )
 
-        # Add noise to clean images
+        # Add noise to clean images for the diffusion process
         noisy_samples = self.noise_scheduler.add_noise(clean_images, noise, timesteps)
-        model_input = torch.cat([noisy_samples, condition_images], dim=1)
+        model_input = torch.cat([noisy_samples, condition_images], dim=1)  # Concatenate noisy and condition images
 
-        # Predict and optimize
+        # Predict the noise using the model
         noise_pred = self.model(model_input, timesteps).sample
-        loss = torch.nn.functional.mse_loss(noise_pred, noise)
+        loss = torch.nn.functional.mse_loss(noise_pred, noise)  # Calculate mean squared error loss
 
+        # Backpropagation and optimization step
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -220,7 +283,14 @@ class DiffusionCleaner:
         return loss.item()
 
     def validate(self, epoch):
-        self.model.eval()
+        """
+        Perform validation to evaluate the model's performance on unseen data.
+        Saves the best model checkpoint based on validation loss.
+        
+        Args:
+            epoch: The current epoch number
+        """
+        self.model.eval()  # Set the model to evaluation mode
         val_loss = 0.0
         with torch.no_grad():
             for batch_idx, (clean_images, noisy_images) in enumerate(self.val_dataloader):
@@ -228,16 +298,26 @@ class DiffusionCleaner:
                 val_loss += loss
         val_loss /= len(self.val_dataloader)
 
+        # Log validation loss
         logger.info(f"Epoch {epoch} | Validation Loss: {val_loss:.4f}")
 
+        # Save the model if the validation loss is the lowest seen so far
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             self.save_model(epoch)
             logger.info(f"New best model saved with validation loss {val_loss:.4f}")
-        self.model.train()
+        self.model.train()  # Set model back to training mode
 
     def _validation_step(self, clean_images: torch.Tensor, condition_images: torch.Tensor) -> float:
-        """Execute a single validation step."""
+        """
+        Execute a single validation step on a batch of data.
+        
+        Args:
+            clean_images: Clean images used for adding noise
+            condition_images: Noisy images used as conditioning input
+        Returns:
+            Validation loss value
+        """
         clean_images = clean_images.to(self.device)
         condition_images = condition_images.to(self.device)
 
@@ -252,24 +332,33 @@ class DiffusionCleaner:
         noisy_samples = self.noise_scheduler.add_noise(clean_images, noise, timesteps)
         model_input = torch.cat([noisy_samples, condition_images], dim=1)
 
-        # Predict
+        # Predict the noise and calculate loss
         noise_pred = self.model(model_input, timesteps).sample
         loss = torch.nn.functional.mse_loss(noise_pred, noise)
 
         return loss.item()
 
     def save_model(self, epoch):
-        """Save the model checkpoint."""
+        """
+        Save the model checkpoint to the checkpoint directory.
+        
+        Args:
+            epoch: The current epoch number
+        """
         save_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
         torch.save({
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
+            'config': self.config,
         }, save_path)
 
     def load_model(self):
-        """Load the best model from checkpoint."""
+        """
+        Load the best model checkpoint from the checkpoint directory if available.
+        """
         checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -281,14 +370,14 @@ class DiffusionCleaner:
 
     def test(self, num_samples: int = 4):
         """
-        Run inference and visualize results for multiple samples.
+        Run inference and visualize results for multiple samples from the test set.
 
         Args:
             num_samples: Number of samples to generate and visualize
         """
-        self.load_model()
-        self.model.eval()
-        self.noise_scheduler.set_timesteps(self.config.num_inference_steps)
+        self.load_model()  # Load the best model for testing
+        self.model.eval()  # Set model to evaluation mode
+        self.noise_scheduler.set_timesteps(self.config.num_inference_steps)  # Set inference steps
 
         with torch.no_grad():
             # Get sample images from the test dataloader
@@ -301,13 +390,13 @@ class DiffusionCleaner:
             for condition in conditions:
                 # Add batch dimension
                 condition = condition.unsqueeze(0)
-                result = self._denoise_image(condition)
+                result = self._denoise_image(condition)  # Perform image restoration
                 results.append(result)
 
-            # Concatenate all results
+            # Concatenate all results for visualization
             results = torch.cat(results, dim=0)
 
-            # Visualize results
+            # Visualize the clean, noisy, and restored images
             self._plot_results(
                 clean_images,
                 conditions,
@@ -317,7 +406,14 @@ class DiffusionCleaner:
             )
 
     def _denoise_image(self, condition: torch.Tensor) -> torch.Tensor:
-        """Denoise a single image using the diffusion model."""
+        """
+        Denoise a single image using the diffusion model.
+        
+        Args:
+            condition: Noisy image used as conditioning input
+        Returns:
+            Restored image tensor
+        """
         noisy_image = torch.randn(
             1, self.config.channels,
             self.config.image_size,
@@ -325,15 +421,18 @@ class DiffusionCleaner:
             device=self.device
         )
 
+        # Iteratively denoise the image over the diffusion steps
         for t in self.noise_scheduler.timesteps:
             model_input = torch.cat([noisy_image, condition], dim=1)
             noise_pred = self.model(model_input, t).sample
             noisy_image = self.noise_scheduler.step(noise_pred, t, noisy_image).prev_sample
 
-        return noisy_image
+        restored_image = noisy_image  # Final denoised image
+
+        return restored_image
 
     def _plot_results(self, clean_images: torch.Tensor, conditions: torch.Tensor, results: torch.Tensor,
-                      num_samples: int = 8, save_path: str = 'restoration_results.png'):
+                      num_samples: int = 4, save_path: str = 'restoration_results.png'):
         """
         Plot multiple results in a grid layout and save as a single image.
 
@@ -344,7 +443,7 @@ class DiffusionCleaner:
             num_samples: Number of samples to plot
             save_path: Path to save the result image
         """
-        # Ensure we don't try to plot more than we have
+        # Ensure we do not try to plot more than we have
         num_samples = min(num_samples, clean_images.shape[0])
 
         # Create a grid of plots: num_samples rows x 3 columns
@@ -355,7 +454,7 @@ class DiffusionCleaner:
         for ax, title in zip(axes[0], titles):
             ax.set_title(title, fontsize=12, pad=10)
 
-        # Plot each set of images
+        # Plot each set of images (clean, noisy, restored)
         for idx in range(num_samples):
             images = [
                 clean_images[idx:idx+1],
@@ -368,7 +467,7 @@ class DiffusionCleaner:
                 axes[idx, col].axis('off')
 
                 # Add PSNR and SSIM metrics for generated images
-                if col == 2:  # Generated image column
+                if col == 2:  # Only add metrics to generated image column
                     psnr = self._calculate_psnr(clean_images[idx:idx+1], img)
                     ssim = self._calculate_ssim(clean_images[idx:idx+1], img)
                     metrics_text = f'PSNR: {psnr:.2f}\nSSIM: {ssim:.3f}'
@@ -381,23 +480,37 @@ class DiffusionCleaner:
         plt.show()
 
     def _calculate_psnr(self, clean_img: torch.Tensor, generated_img: torch.Tensor) -> float:
-        """Calculate Peak Signal-to-Noise Ratio between two images."""
+        """
+        Calculate Peak Signal-to-Noise Ratio (PSNR) between two images.
+        
+        Args:
+            clean_img: Original clean image
+            generated_img: Restored image to be compared
+        Returns:
+            PSNR value
+        """
         mse = torch.mean((clean_img.cpu() - generated_img.cpu()) ** 2)
         if mse == 0:
-            return float('inf')
-        max_pixel = 1.0
+            return float('inf')  # Return infinity if there is no difference
+        max_pixel = 1.0  # Maximum possible pixel value
         psnr = 20 * torch.log10(max_pixel / torch.sqrt(mse))
         return psnr.item()
 
     def _calculate_ssim(self, clean_img: torch.Tensor, generated_img: torch.Tensor) -> float:
         """
-        Calculate Structural Similarity Index between two images.
+        Calculate Structural Similarity Index (SSIM) between two images.
         This is a simplified version of SSIM.
+        
+        Args:
+            clean_img: Original clean image
+            generated_img: Restored image to be compared
+        Returns:
+            SSIM value
         """
         clean_img = clean_img.cpu()
         generated_img = generated_img.cpu()
 
-        # Constants for stability
+        # Constants for stability in SSIM calculation
         C1 = (0.01 * 1) ** 2
         C2 = (0.03 * 1) ** 2
 
@@ -417,14 +530,16 @@ class DiffusionCleaner:
         return ssim.item()
 
 def main():
-    """Main execution function."""
-    torch.manual_seed(1234)    # Set random seed for reproducibility
+    """
+    Main execution function for training and testing the model.
+    """
+    torch.manual_seed(1234)  # Set random seed for reproducibility
     try:
-        torchvision.disable_beta_transforms_warning()
-        config = ModelConfig()
-        model = DiffusionCleaner(config)
-        model.train()
-        model.test(num_samples=4)
+        torchvision.disable_beta_transforms_warning()  # Disable warnings for torchvision beta features
+        config = ModelConfig()  # Create model configuration
+        model = DiffusionCleaner(config)  # Initialize the model with config
+        model.train()  # Train the model
+        model.test(num_samples=4)  # Test the model with 4 samples
     except Exception as e:
         logger.error(f"Error during execution: {str(e)}")
         raise
