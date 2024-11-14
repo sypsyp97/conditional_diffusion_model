@@ -1,7 +1,7 @@
 [![DOI](https://zenodo.org/badge/884008167.svg)](https://doi.org/10.5281/zenodo.14047997)
 # Diffusion Cleaner
 
-Diffusion Cleaner is the implementation of conditional diffusion models designed for image artifact removal. This repo demonstrates how to train and use diffusion models to clean images by conditioning on corrupted images.
+Diffusion Cleaner is the implementation of conditional diffusion models designed for image artifact removal. This repo demonstrates how to train and use diffusion models to clean images by conditioning on corrupted images. Please star this project if you use this repository in your research. Thank you!
 
 ![Results](restoration_results_4_samples.png)
 *Figure 1: Examples of image restoration using conditional diffusion model.*
