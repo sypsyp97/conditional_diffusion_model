@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from typing import Tuple, Optional
 import logging
 
+#set working directory current path
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,15 +23,15 @@ class ModelConfig:
     Configuration parameters for the diffusion model.
     Includes batch size, number of epochs, learning rate, and model directory.
     """
-    batch_size: int = 64  # Number of samples per training batch
-    num_epochs: int = 30  # Total number of training epochs
-    learning_rate: float = 1e-4  # Learning rate for the optimizer
-    image_size: int = 32  # Size to which input images are resized
+    batch_size: int = 16  # Number of samples per training batch
+    num_epochs: int = 200  # Total number of training epochs
+    learning_rate: float = 2e-4  # Learning rate for the optimizer
+    image_size: int = 64  # Size to which input images are resized
     channels: int = 1  # Number of channels, 1 for grayscale images (MNIST)
-    lr_warmup_steps: int = 700  # Number of warmup steps for learning rate scheduling
+    lr_warmup_steps: int = 500  # Number of warmup steps for learning rate scheduling
     num_train_timesteps: int = 1000  # Total number of timesteps during training
     num_inference_steps: int = 100  # Total number of steps during inference
-    num_cycles: float = 1.0  # Number of cycles for cosine scheduler
+    num_cycles: float = 2.0  # Number of cycles for cosine scheduler
     checkpoint_dir: str = './conditional/checkpoints'  # Directory to save model checkpoints
     data_dir: str = './conditional/data'  # Directory to store the dataset
     device: str = "cuda" if torch.cuda.is_available() else "cpu"  # Use GPU if available
@@ -60,14 +63,14 @@ class NoisyMNISTDataset(Dataset):
             Noisy image tensor with added artifacts
         """
         noisy_img = img.clone()
-        # Random number of patches to add, between 3 to 5
-        num_patches = torch.randint(3, 6, (1,)).item()
+        # Random number of patches to add, between 4 to 6
+        num_patches = torch.randint(4, 7, (1,)).item()
 
         # Loop over the number of patches and add them to the image
         for _ in range(num_patches):
-            # Random patch size between 5 and 10 pixels
-            patch_h = torch.randint(5, 11, (1,)).item()
-            patch_w = torch.randint(5, 11, (1,)).item()
+            # Random patch size between 10 and 20 pixels
+            patch_h = torch.randint(10, 21, (1,)).item()
+            patch_w = torch.randint(10, 21, (1,)).item()
 
             # Random position for the patch, ensuring it fits within the image
             max_h = img.shape[1] - patch_h
@@ -75,8 +78,9 @@ class NoisyMNISTDataset(Dataset):
             h_start = torch.randint(0, max_h + 1, (1,)).item()
             w_start = torch.randint(0, max_w + 1, (1,)).item()
 
-            # Add a white patch to the image
-            noisy_img[:, h_start:h_start+patch_h, w_start:w_start+patch_w] = 1.0
+            # Add a patch with a random color to the image
+            random_color = torch.rand(1).item()  # Random grayscale value between 0 and 1
+            noisy_img[:, h_start:h_start+patch_h, w_start:w_start+patch_w] = random_color
 
         return torch.clamp(noisy_img, 0, 1)  # Ensure pixel values are within valid range [0, 1]
 
@@ -117,12 +121,14 @@ class DiffusionCleaner:
 
         # Initialize model components
         self.model = self._setup_model()
+        self.model_name = self.model.__class__.__name__
         self.noise_scheduler = self._setup_scheduler()
         self.transform = self._setup_transforms()
         self._setup_data()
         self.optimizer, self.lr_scheduler = self._setup_optimization()
         self.best_val_loss = float('inf')  # Best validation loss initialized to infinity
         self.checkpoint_dir = self.config.checkpoint_dir
+        self.model_save_path = os.path.join(self.checkpoint_dir, f'best_{self.model_name}.pth')
         if not os.path.exists(self.checkpoint_dir):
             os.makedirs(self.checkpoint_dir)
 
@@ -138,7 +144,12 @@ class DiffusionCleaner:
             sample_size=self.config.image_size,  # Size of input images
             in_channels=self.config.channels * 2,  # Number of input channels (clean + noisy)
             out_channels=self.config.channels,  # Output channels (predicted noise)
-            block_out_channels=(32, 64, 128, 256),  # Channels per block
+            down_block_types=("DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D"),  # Down blocks
+            up_block_types=("UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"),  # Up blocks
+            downsample_type="resnet",  # Downsample type for UNet
+            upsample_type="resnet",  # Upsample type for UNet
+            norm_num_groups=8,
+            block_out_channels=(64, 128, 256, 512),  # Channels per block
         ).to(self.device)
         return model
 
@@ -150,8 +161,8 @@ class DiffusionCleaner:
         """
         return DDIMScheduler(
             num_train_timesteps=self.config.num_train_timesteps,  # Number of timesteps for noise scheduling
-            beta_schedule="linear",  # Beta schedule for noise levels
-            prediction_type="epsilon"  # Type of prediction used
+            beta_schedule="squaredcos_cap_v2",
+            thresholding=True,
         )
 
     def _setup_transforms(self) -> transforms.Compose:
@@ -345,7 +356,6 @@ class DiffusionCleaner:
         Args:
             epoch: The current epoch number
         """
-        save_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
         torch.save({
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -353,20 +363,19 @@ class DiffusionCleaner:
             'lr_scheduler_state_dict': self.lr_scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': self.config,
-        }, save_path)
+        }, self.model_save_path)
 
     def load_model(self):
         """
         Load the best model checkpoint from the checkpoint directory if available.
         """
-        checkpoint_path = os.path.join(self.checkpoint_dir, 'best_model.pth')
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if os.path.exists(self.model_save_path):
+            checkpoint = torch.load(self.model_save_path, map_location=self.device)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.best_val_loss = checkpoint['best_val_loss']
             logger.info(f"Loaded best model from epoch {checkpoint['epoch']} with validation loss {self.best_val_loss:.4f}")
         else:
-            logger.warning("No checkpoint found at '{}'".format(checkpoint_path))
+            logger.warning("No checkpoint found at '{}'".format(self.model_save_path))
 
     def test(self, num_samples: int = 4):
         """
@@ -402,7 +411,7 @@ class DiffusionCleaner:
                 conditions,
                 results,
                 num_samples=num_samples,
-                save_path=f'restoration_results_{num_samples}samples.png'
+                save_path=f'restoration_results_{num_samples}_samples.png'
             )
 
     def _denoise_image(self, condition: torch.Tensor) -> torch.Tensor:
@@ -538,7 +547,7 @@ def main():
         torchvision.disable_beta_transforms_warning()  # Disable warnings for torchvision beta features
         config = ModelConfig()  # Create model configuration
         model = DiffusionCleaner(config)  # Initialize the model with config
-        model.train()  # Train the model
+        # model.train()  # Train the model
         model.test(num_samples=4)  # Test the model with 4 samples
     except Exception as e:
         logger.error(f"Error during execution: {str(e)}")
